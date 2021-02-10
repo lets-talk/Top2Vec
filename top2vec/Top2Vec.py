@@ -185,8 +185,10 @@ class Top2Vec:
                  min_cluster_size=15,
                  min_samples=15,
                  cluster_selection_epsilon=0.,
+                 epsilon=0.1,
+                 eliminate_noise=False,
                  ):
-
+        self.epsilon = epsilon
         if verbose:
             logger.setLevel(logging.DEBUG)
             self.verbose = True
@@ -361,8 +363,10 @@ class Top2Vec:
         # calculate topic vectors from dense areas of documents
         logger.info('Finding topics')
 
+        self.labels_ = cluster.labels_
+
         # create topic vectors
-        self._create_topic_vectors(cluster.labels_)
+        self._create_topic_vectors(self.labels_)
 
         # deduplicate topics
         self._deduplicate_topics()
@@ -372,7 +376,15 @@ class Top2Vec:
 
         # assign documents to topic
         self.doc_top, self.doc_dist = self._calculate_documents_topic(self.topic_vectors,
-                                                                      self._get_document_vectors())
+                                                                      self._get_document_vectors(),
+                                                                      )
+
+        # ADDED
+        print("Number of noisy data points: %s" % len([i for i in self.labels_ if i == -1]))
+        for i, lbl in enumerate(self.labels_):
+            if lbl == -1:
+                self.doc_top[i] = -1
+                self.doc_dist[i] = 0.
 
         # calculate topic sizes
         self.topic_sizes = self._calculate_topic_sizes(hierarchy=False)
@@ -565,11 +577,12 @@ class Top2Vec:
 
     def _deduplicate_topics(self):
         core_samples, labels = dbscan(X=self.topic_vectors,
-                                      eps=0.1,
+                                      eps=self.epsilon,
                                       min_samples=2,
                                       metric="cosine")
 
         duplicate_clusters = set(labels)
+        print("Dedupliation", len(self.topic_vectors))
 
         if len(duplicate_clusters) > 1 or -1 not in duplicate_clusters:
 
@@ -586,12 +599,14 @@ class Top2Vec:
                                                        .mean(axis=0))])
 
             self.topic_vectors = unique_topics
+        print("Dedupliation", len(self.topic_vectors))
 
     def _calculate_topic_sizes(self, hierarchy=False):
         if hierarchy:
             topic_sizes = pd.Series(self.doc_top_reduced).value_counts()
         else:
             topic_sizes = pd.Series(self.doc_top).value_counts()
+        topic_sizes.pop(-1)
 
         return topic_sizes
 
@@ -602,6 +617,7 @@ class Top2Vec:
             self.topic_words_reduced = self.topic_words_reduced[self.topic_sizes_reduced.index]
             self.topic_word_scores_reduced = self.topic_word_scores_reduced[self.topic_sizes_reduced.index]
             old2new = dict(zip(self.topic_sizes_reduced.index, range(self.topic_sizes_reduced.index.shape[0])))
+            old2new[-1] = -1
             self.doc_top_reduced = np.array([old2new[i] for i in self.doc_top_reduced])
             self.hierarchy = [self.hierarchy[i] for i in self.topic_sizes_reduced.index]
             self.topic_sizes_reduced.reset_index(drop=True, inplace=True)
@@ -610,6 +626,7 @@ class Top2Vec:
             self.topic_words = self.topic_words[self.topic_sizes.index]
             self.topic_word_scores = self.topic_word_scores[self.topic_sizes.index]
             old2new = dict(zip(self.topic_sizes.index, range(self.topic_sizes.index.shape[0])))
+            old2new[-1] = -1
             self.doc_top = np.array([old2new[i] for i in self.doc_top])
             self.topic_sizes.reset_index(drop=True, inplace=True)
 
@@ -1405,7 +1422,7 @@ class Top2Vec:
 
         return self.hierarchy
 
-    def hierarchical_topic_reduction(self, num_topics):
+    def hierarchical_topic_reduction(self, num_topics, relative_size_smallest_cluster=None):
         """
         Reduce the number of topics discovered by Top2Vec.
 
@@ -1437,9 +1454,17 @@ class Top2Vec:
         top_vecs = self.topic_vectors
         top_sizes = [self.topic_sizes[i] for i in range(0, len(self.topic_sizes))]
         hierarchy = [[i] for i in range(self.topic_vectors.shape[0])]
+        distances = []
 
         count = 0
-        interval = max(int(self._get_document_vectors().shape[0] / 50000), 1)
+        doc_vecs = self._get_document_vectors()
+        interval = max(int(doc_vecs.shape[0] / 50000), 1)
+        n_docs = len(doc_vecs)
+        n_noise_points = len([i for i in self.labels_ if i == -1])
+        min_size_smallest_cluster = None
+        if relative_size_smallest_cluster:
+            min_size_smallest_cluster = int(relative_size_smallest_cluster * (n_docs - n_noise_points))
+            print("Minum size of smallest cluster is set to be %s" % min_size_smallest_cluster)
 
         while num_topics_current > num_topics:
 
@@ -1450,6 +1475,7 @@ class Top2Vec:
             most_sim = sims[1]
             if most_sim == smallest:
                 most_sim = sims[0]
+            distances.append(res[most_sim])
 
             # calculate combined topic vector
             top_vec_smallest = top_vecs[smallest]
@@ -1474,8 +1500,12 @@ class Top2Vec:
                 doc_top = self._calculate_documents_topic(topic_vectors=top_vecs,
                                                           document_vectors=self._get_document_vectors(),
                                                           dist=False)
+                # ADDED
+                for i, lbl in enumerate(self.labels_):
+                    if lbl == -1:
+                        doc_top[i] = -1
                 topic_sizes = pd.Series(doc_top).value_counts()
-                top_sizes = [topic_sizes[i] for i in range(0, len(topic_sizes))]
+                top_sizes = [topic_sizes.get(i, 0) for i in range(0, len(topic_sizes) - 1)]
 
             else:
                 smallest_size = top_sizes.pop(smallest)
@@ -1498,6 +1528,11 @@ class Top2Vec:
             combined_inds = smallest_inds + most_sim_inds
             hierarchy.append(combined_inds)
 
+            size_smallest_cluster = min(top_sizes)
+            if min_size_smallest_cluster:
+                if size_smallest_cluster >= min_size_smallest_cluster:
+                    break
+
         # re-calculate topic vectors from clusters
         doc_top = self._calculate_documents_topic(topic_vectors=top_vecs,
                                                   document_vectors=self._get_document_vectors(),
@@ -1511,6 +1546,13 @@ class Top2Vec:
         # assign documents to topic
         self.doc_top_reduced, self.doc_dist_reduced = self._calculate_documents_topic(self.topic_vectors_reduced,
                                                                                       self._get_document_vectors())
+
+        # ADDED
+        for i, lbl in enumerate(self.labels_):
+            if lbl == -1:
+                self.doc_top_reduced[i] = -1
+                self.doc_dist_reduced[i] = 0.
+
         # find topic words and scores
         self.topic_words_reduced, self.topic_word_scores_reduced = self._find_topic_words_and_scores(
             topic_vectors=self.topic_vectors_reduced)
@@ -1520,6 +1562,11 @@ class Top2Vec:
 
         # re-order topics
         self._reorder_topics(hierarchy=True)
+        print("Distances between merged clusters", np.mean(distances))
+        print(distances)
+
+        print("Distance between first and other cluster", np.inner(self.topic_vectors_reduced[0], self.topic_vectors_reduced))
+        print("Distance between second and other cluster", np.inner(self.topic_vectors_reduced[1], self.topic_vectors_reduced))
 
         return self.hierarchy
 
